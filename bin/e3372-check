@@ -1,0 +1,18 @@
+#!/bin/bash
+# Проверка модемов E3372 HiLink: USB -> iface/IP -> webui -> cellular -> exit IP
+echo "== USB (12d1:14dc): $(lsusb | grep -c 12d1:14dc) шт. =="
+printf "%-4s %-16s %-16s %-6s %-9s %-5s %s\n" N IFACE HOST-IP WEBUI CONN NET EXIT-IP
+ip -4 -o addr show | awk '/192\.168\.[0-9]+\.100\//{print $2,$4}' | sort -t. -k3 -n | \
+while read -r IFACE CIDR; do
+  IP=${CIDR%/*}; N=$(printf '%s' "$IP" | cut -d. -f3); GW="192.168.$N.1"
+  ST=$(curl -s -m3 "http://$GW/api/monitoring/status" 2>/dev/null)
+  if [ -z "$ST" ]; then WEB="—"; CONN="—"; NET="—"
+  else
+    WEB=ok
+    CS=$(printf '%s' "$ST" | grep -oP '(?<=<ConnectionStatus>)[0-9]+')
+    NET=$(printf '%s' "$ST" | grep -oP '(?<=<CurrentNetworkType>)[0-9]+'); NET=${NET:-?}
+    case "$CS" in 901)CONN=онлайн;;902)CONN=offline;;900)CONN=конн;;904|905)CONN=нет-сети;;"")CONN="?";;*)CONN=$CS;;esac
+  fi
+  EXIT=$(curl --interface "$IP" -s -m8 http://ip.me 2>/dev/null); [ -z "$EXIT" ] && EXIT="—"
+  printf "%-4s %-16s %-16s %-6s %-9s %-5s %s\n" "$N" "$IFACE" "$IP" "$WEB" "$CONN" "$NET" "$EXIT"
+done

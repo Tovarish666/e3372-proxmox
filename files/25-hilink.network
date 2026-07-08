@@ -1,0 +1,16 @@
+[Match]
+Driver=cdc_ether rndis_host cdc_ncm huawei_cdc_ncm
+
+[Network]
+DHCP=ipv4
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+
+[DHCPv4]
+UseDNS=no
+UseNTP=no
+UseGateway=false
+UseRoutes=false
+
+[Link]
+RequiredForOnline=no
