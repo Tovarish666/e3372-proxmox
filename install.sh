@@ -20,9 +20,11 @@
 # =============================================================================
 set -euo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/Tovarish666/e3372-proxmox/main"
+TAR_URLS=(
+  "https://codeload.github.com/Tovarish666/e3372-proxmox/tar.gz/refs/heads/main"
+  "https://github.com/Tovarish666/e3372-proxmox/archive/refs/heads/main.tar.gz"
+)
 CACHE=/var/cache/e3372
-DEBDIR="$CACHE/deb"
 NETDIR=/etc/systemd/network
 HOOK=/etc/networkd-dispatcher/routable.d/50-e3372
 CHECK=/usr/local/bin/e3372-check
@@ -37,21 +39,26 @@ command -v apt-get >/dev/null 2>&1 || die "нужен apt (Debian/Proxmox)"
 command -v curl    >/dev/null 2>&1 || die "нужен curl"
 
 # ---------------------------------------------------------------------------
-log "1/6 качаю вшитый apt-репо зависимостей из GitHub…"
-rm -rf "$DEBDIR"; mkdir -p "$DEBDIR"
-for meta in Packages Packages.gz Release manifest.txt; do
-  curl -fsSL "$REPO_RAW/deb/$meta" -o "$DEBDIR/$meta" || die "нет deb/$meta в репо"
+log "1/6 качаю репозиторий одним архивом из GitHub…"
+WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+ok=0
+for url in "${TAR_URLS[@]}"; do
+  echo "      → $url"
+  if curl --progress-bar -fL --retry 5 --retry-delay 2 --retry-connrefused \
+          --connect-timeout 30 --max-time 900 -o "$WORK/repo.tgz" "$url"; then
+    ok=1; break
+  fi
+  warn "не вышло с этого зеркала, пробую следующее…"
 done
-n=0
-while read -r f; do
-  [ -n "$f" ] || continue
-  curl -fsSL "$REPO_RAW/deb/$f" -o "$DEBDIR/$f" || die "не скачал deb/$f"
-  n=$((n+1))
-done < "$DEBDIR/manifest.txt"
-log "скачано $n пакетов ($(du -sh "$DEBDIR" | cut -f1))"
+[ "$ok" = 1 ] || die "не скачал архив с GitHub (проблема связи с github.com/codeload)"
+tar -xzf "$WORK/repo.tgz" -C "$WORK" || die "битый архив"
+DEBDIR="$WORK/e3372-proxmox-main/deb"
+[ -s "$DEBDIR/Release" ] || die "в архиве нет deb/Release — неожиданно"
+log "распаковано: $(ls "$DEBDIR"/*.deb 2>/dev/null | wc -l | tr -d ' ') пакетов ($(du -sh "$DEBDIR" | cut -f1))"
 
 # ---------------------------------------------------------------------------
 log "2/6 ставлю зависимости офлайн из локального репо…"
+mkdir -p "$CACHE"
 echo "deb [trusted=yes] file:$DEBDIR ./" > "$CACHE/e3372.list"
 APT=(apt-get
   -o Dir::Etc::SourceList="$CACHE/e3372.list"
