@@ -66,9 +66,19 @@ APT=(apt-get
   -o APT::Get::List-Cleanup=0
   -o Acquire::AllowInsecureRepositories=true)
 "${APT[@]}" update >/dev/null 2>&1 || warn "apt update (local) с предупреждениями"
-"${APT[@]}" install -y --no-download --no-install-recommends --allow-unauthenticated \
-    usb-modeswitch usb-modeswitch-data networkd-dispatcher \
-  || die "установка из локального репо не удалась (см. вывод выше)"
+# без --no-download: apt копирует .deb из file:-репо в кэш и ставит с абсолютным путём
+# (это локальная копия, не сеть — источник только наш file:-репозиторий)
+if ! "${APT[@]}" install -y --no-install-recommends --allow-unauthenticated \
+        usb-modeswitch usb-modeswitch-data networkd-dispatcher; then
+  warn "apt-путь не сработал — ставлю недостающее напрямую через dpkg…"
+  dpkg -i "$DEBDIR"/networkd-dispatcher_*.deb "$DEBDIR"/python3-gi_*.deb \
+          "$DEBDIR"/python3-dbus_*.deb "$DEBDIR"/gir1.2-*.deb \
+          "$DEBDIR"/libgirepository-1.0-1_*.deb "$DEBDIR"/libjim0.83_*.deb \
+          "$DEBDIR"/libusb-1.0-0_*.deb "$DEBDIR"/usb-modeswitch_*.deb \
+          "$DEBDIR"/usb-modeswitch-data_*.deb 2>/dev/null || true
+  command -v networkd-dispatcher >/dev/null 2>&1 || \
+    die "не удалось поставить networkd-dispatcher ни apt, ни dpkg"
+fi
 modprobe -a cdc_ether rndis_host cdc_ncm huawei_cdc_ncm 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
