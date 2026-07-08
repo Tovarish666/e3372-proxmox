@@ -66,18 +66,24 @@ APT=(apt-get
   -o APT::Get::List-Cleanup=0
   -o Acquire::AllowInsecureRepositories=true)
 "${APT[@]}" update >/dev/null 2>&1 || warn "apt update (local) с предупреждениями"
-# без --no-download: apt копирует .deb из file:-репо в кэш и ставит с абсолютным путём
-# (это локальная копия, не сеть — источник только наш file:-репозиторий)
-if ! "${APT[@]}" install -y --no-install-recommends --allow-unauthenticated \
-        usb-modeswitch usb-modeswitch-data networkd-dispatcher; then
-  warn "apt-путь не сработал — ставлю недостающее напрямую через dpkg…"
-  dpkg -i "$DEBDIR"/networkd-dispatcher_*.deb "$DEBDIR"/python3-gi_*.deb \
-          "$DEBDIR"/python3-dbus_*.deb "$DEBDIR"/gir1.2-*.deb \
-          "$DEBDIR"/libgirepository-1.0-1_*.deb "$DEBDIR"/libjim0.83_*.deb \
-          "$DEBDIR"/libusb-1.0-0_*.deb "$DEBDIR"/usb-modeswitch_*.deb \
-          "$DEBDIR"/usb-modeswitch-data_*.deb 2>/dev/null || true
-  command -v networkd-dispatcher >/dev/null 2>&1 || \
-    die "не удалось поставить networkd-dispatcher ни apt, ни dpkg"
+# apt ТОЛЬКО считает, что реально нужно доставить (учитывает установленное/версии,
+# ничего не даунгрейдит), а ставим напрямую dpkg из абсолютных путей вендоренных .deb —
+# это обходит баг apt с относительным путём в file:-репо ('not absolute').
+mapfile -t NEED < <("${APT[@]}" install -s --no-install-recommends \
+    usb-modeswitch usb-modeswitch-data networkd-dispatcher 2>/dev/null \
+    | awk '/^Inst /{print $2}')
+if [ "${#NEED[@]}" -eq 0 ]; then
+  log "зависимости уже установлены"
+else
+  log "ставлю: ${NEED[*]}"
+  files=()
+  for p in "${NEED[@]}"; do
+    fp=$(ls "$DEBDIR/${p}_"*.deb 2>/dev/null | head -1)
+    [ -n "$fp" ] || die "нет .deb для '$p' в вендоренном репо"
+    files+=("$fp")
+  done
+  dpkg -i "${files[@]}" || dpkg -i "${files[@]}"   # 2-й проход добивает порядок конфигурации
+  command -v networkd-dispatcher >/dev/null 2>&1 || die "networkd-dispatcher не поставился"
 fi
 modprobe -a cdc_ether rndis_host cdc_ncm huawei_cdc_ncm 2>/dev/null || true
 
