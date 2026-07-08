@@ -87,6 +87,27 @@ else
 fi
 modprobe -a cdc_ether rndis_host cdc_ncm huawei_cdc_ncm 2>/dev/null || true
 
+# --- generic Huawei ZeroCD -> HiLink switch ---------------------------------
+# Срабатывает ТОЛЬКО на модемах в CD-ROM (12d1:1f01): не-авто E3372h/s, K5160.
+# Авто-переключающиеся (сразу 14dc) этот конфиг не касается — нулевой риск.
+# HuaweiNewMode триггерит переключение, модем сам выбирает свой HiLink-PID;
+# TargetProductList — лишь для подтверждения успеха (перечислены все варианты).
+log "    generic Huawei switch (для не-авто E3372/K5160)…"
+install -d /etc/usb_modeswitch.d
+for cdpid in 1f01 14fe 1505 155a 1c0b; do
+  cfg="/etc/usb_modeswitch.d/12d1:$cdpid"
+  [ -f "$cfg" ] && [ ! -f "$cfg.e3372.bak" ] && cp "$cfg" "$cfg.e3372.bak"
+  cat > "$cfg" <<'MS'
+TargetVendor=0x12d1
+TargetProductList="14dc,14db,1575,155e,1506,14fe,1c1e,1c20,1442"
+HuaweiNewMode=1
+MS
+done
+udevadm control --reload 2>/dev/null || true
+# переключить уже воткнутые CD-ROM модемы прямо сейчас (без переткивания)
+udevadm trigger --action=add --subsystem-match=usb --attr-match=idVendor=12d1 2>/dev/null || true
+sleep 3
+
 # ---------------------------------------------------------------------------
 log "3/6 systemd-networkd: подъём HiLink-интерфейсов по DHCP…"
 install -d "$NETDIR"
