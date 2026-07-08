@@ -3,12 +3,12 @@
 Драйвер-инсталлер для модемов **Huawei E3372 (HiLink)** на хосте **Proxmox VE / Debian**.
 Одна команда — и пачка модемов поднимается, маршрутизируется и готова к работе.
 
-**Без зависимостей и без `apt`.** Использует только то, что уже есть в Proxmox из коробки:
-`systemd-networkd`, `udev`, `iproute2`, `bash`. Ничего не скачивает (кроме самого себя),
-поэтому не ломается на дохлых apt-зеркалах и работает на любом Proxmox одинаково.
+**Все зависимости вшиты в репозиторий** (`deb/` — локальный apt-репо, Debian 13 trixie / amd64):
+`usb-modeswitch`, `networkd-dispatcher` и весь их dependency-closure. Ставятся **офлайн из репо**,
+без обращения к внешним apt-зеркалам — не ломается на дохлом `security.debian.org` и одинаково
+работает на любом сервере.
 
 Проверено на E3372**h-153**; подходит для **h-607, s-153, K5160** (Balong, HiLink).
-Новый Qualcomm **h-320/-325** с завода уже HiLink — переключать не нужно, только сетевой слой.
 
 ## Установка (одной командой)
 
@@ -16,26 +16,28 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/Tovarish666/e3372-proxmox/main/install.sh)
 ```
 
-~1 минута, идемпотентно, root.
+Идемпотентно, root, Debian 13 (trixie) / Proxmox VE 9, amd64.
 
 ## Что делает
 
 | Шаг | Действие |
 |-----|----------|
-| 1 | Грузит драйверы ядра (cdc_ether/rndis/ncm — есть в стоке) |
-| 2 | Поднимает интерфейсы модемов по DHCP через **systemd-networkd** (матч по драйверу, не по имени/MAC — у всех E3372 одинаковый MAC) |
-| 3 | Loose `rp_filter` (иначе ответы на 20 интерфейсах режутся) |
-| 4 | **Per-modem policy routing**: своя таблица на модем, `ip rule from 192.168.N.100 → default via 192.168.N.1`. Реализовано скриптом-реконсайлером + **systemd timer** (boot + каждые 15с, ловит hotplug) и udev-толчком — без сторонних демонов |
-| 5 | Ставит диагностику `e3372-check` |
+| 1 | Качает вшитый apt-репо (`deb/`) из GitHub |
+| 2 | Ставит `usb-modeswitch(+data)` и `networkd-dispatcher` **офлайн** из локального репо (apt ставит только недостающее, установленное новее — не трогает) |
+| 3 | Поднимает интерфейсы модемов по DHCP — **systemd-networkd** (матч по драйверу, не по имени/MAC: у всех E3372 одинаковый MAC) |
+| 4 | Loose `rp_filter` |
+| 5 | **Per-modem policy routing** через networkd-dispatcher hook — авто на boot и hotplug |
+| 6 | Ставит диагностику `e3372-check` |
 
-## Почему без вшитых .deb
+## Как вшиты зависимости
 
-Раньше требовался `networkd-dispatcher` (apt). Он заменён на systemd-timer + `iproute2`,
-которые уже есть в системе. Вшивать .deb-пакеты намеренно не стал: они привязаны к версии
-Debian и архитектуре и сломались бы на другом сервере. Ноль зависимостей надёжнее.
+`deb/` — это самодостаточный flat apt-репозиторий: 66 .deb (trixie/amd64) + `Packages`/`Packages.gz`/`Release`.
+Инсталлер поднимает его как `deb [trusted=yes] file:...` и ставит через apt **без сети**. Пакеты уже
+установленные (более новой версии) apt не переустанавливает и не даунгрейдит — берёт из репо только
+реально отсутствующее (`networkd-dispatcher`, `python3-gi`, `libjim0.83`, `usb-modeswitch` и т.п.).
 
-`usb-modeswitch` тоже не нужен — E3372 сами переключаются в HiLink (`12d1:14dc`).
-Если попадётся модем, застрявший в CD-ROM (`12d1:1f01`) — напиши, добавлю автономный свитч.
+> Обновить вендоренные пакеты: `python3 tools/regen-debs.py` (см. `tools/`), затем commit.
+> Набор под **trixie/amd64**; для другой версии Debian/арх — перегенерировать.
 
 ## Модель адресации
 
@@ -46,7 +48,6 @@ Debian и архитектуре и сломались бы на другом с
 > ⚠️ **Коллизия подсетей.** Если подсеть модема совпадает с сетью хоста (напр. модем в
 > `192.168.88.x`, а `vmbr0` тоже `192.168.88.0/24`) — маршруты для него **не создаются**
 > (иначе пересекутся шлюзы и ARP). Такой модем авто-пропускается (`journalctl -t e3372`).
-> Перенастрой его на свободную подсеть.
 
 ## Проверка
 
@@ -66,22 +67,22 @@ N    IFACE            HOST-IP          WEBUI  CONN      NET   EXIT-IP
 ## Что ставится в систему
 
 ```
-/etc/systemd/network/25-hilink.network        # DHCP на модемных интерфейсах
-/etc/sysctl.d/99-e3372.conf                    # rp_filter=2
-/usr/local/sbin/e3372-route.sh                 # реконсайлер маршрутов
-/etc/systemd/system/e3372-route.{service,timer}# запуск на boot + каждые 15с
-/etc/udev/rules.d/72-e3372.rules               # мгновенный толчок на hotplug
-/usr/local/bin/e3372-check                     # диагностика
+/etc/systemd/network/25-hilink.network          # DHCP на модемных интерфейсах
+/etc/sysctl.d/99-e3372.conf                      # rp_filter=2
+/etc/networkd-dispatcher/routable.d/50-e3372     # policy routing hook
+/usr/local/bin/e3372-check                       # диагностика
+/var/cache/e3372/                                # временный локальный apt-репо
 ```
 
 ## Удаление
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Tovarish666/e3372-proxmox/main/uninstall.sh)
+# PURGE_PKGS=1 — снести и установленные пакеты
 ```
 
 ## Заметки
 
 - systemd-networkd работает **параллельно** с ifupdown2 Proxmox: `.network` матчит только
   модемы по драйверу, `enp*`/`vmbr*` не трогает.
-- Смена IP модема (реконнект) — задача HiLink API / панели [modlink](https://github.com/Tovarish666/modlink-linux), не этого слоя.
+- Смена IP модема (реконнект) — задача панели [modlink-linux](https://github.com/Tovarish666/modlink-linux), не этого слоя.

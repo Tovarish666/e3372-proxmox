@@ -1,2 +1,0 @@
-ACTION=="add", SUBSYSTEM=="net", ENV{ID_NET_DRIVER}=="cdc_ether",  RUN+="/bin/systemctl start --no-block e3372-route.service"
-ACTION=="add", SUBSYSTEM=="net", ENV{ID_NET_DRIVER}=="rndis_host", RUN+="/bin/systemctl start --no-block e3372-route.service"

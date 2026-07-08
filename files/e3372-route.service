@@ -1,8 +1,0 @@
-[Unit]
-Description=e3372 per-modem policy routing (reconcile)
-After=systemd-networkd.service network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/e3372-route.sh
