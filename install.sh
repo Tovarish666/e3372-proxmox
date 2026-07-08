@@ -1,27 +1,30 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  e3372-proxmox — one-shot driver/setup for Huawei E3372 HiLink modems
-#  on a Proxmox VE / Debian host.
+#  on Proxmox VE / Debian.  БЕЗ ЗАВИСИМОСТЕЙ и БЕЗ apt.
 #
-#  Что делает за один прогон:
-#    1. ставит usb-modeswitch (+data), networkd-dispatcher
-#    2. переводит модемы в сетевую композицию HiLink (CD-ROM -> eth)
-#    3. поднимает все интерфейсы модемов по DHCP (systemd-networkd)
-#    4. вешает per-modem policy-routing (авто на boot и hotplug)
-#    5. защита от коллизии подсети модема с сетью хоста (авто-skip)
-#    6. ставит диагностику `e3372-check`
+#  Использует только то, что уже есть в Proxmox из коробки:
+#    systemd-networkd, udev, iproute2, bash. Ничего не скачивает.
 #
-#  Запуск на новом сервере одной командой:
+#  Что делает:
+#    1. поднимает интерфейсы модемов по DHCP (systemd-networkd, матч по драйверу)
+#    2. loose rp_filter (иначе ответы на 20 iface режутся)
+#    3. per-modem policy routing (своя таблица на модем) — реконсайлер + systemd timer
+#       (замена networkd-dispatcher, без сторонних пакетов)
+#    4. защита от коллизии подсети модема с сетью хоста (авто-skip)
+#    5. ставит диагностику e3372-check
+#
+#  Одна команда на новом сервере:
 #    bash <(curl -fsSL https://raw.githubusercontent.com/Tovarish666/e3372-proxmox/main/install.sh)
 #
-#  Идемпотентно — можно гонять повторно.
+#  Идемпотентно.
 # =============================================================================
 set -euo pipefail
 
-HOST_OCTET=100          # HiLink раздаёт хосту 192.168.<N>.100
 NETDIR=/etc/systemd/network
-HOOK=/etc/networkd-dispatcher/routable.d/50-e3372
+ROUTE_SH=/usr/local/sbin/e3372-route.sh
 CHECK=/usr/local/bin/e3372-check
+OLD_HOOK=/etc/networkd-dispatcher/routable.d/50-e3372   # чистим наследие старой версии
 
 c_g=$'\033[1;32m'; c_y=$'\033[1;33m'; c_r=$'\033[1;31m'; c_0=$'\033[0m'
 log(){  printf '%s[e3372]%s %s\n' "$c_g" "$c_0" "$*"; }
@@ -29,22 +32,23 @@ warn(){ printf '%s[e3372]%s %s\n' "$c_y" "$c_0" "$*"; }
 die(){  printf '%s[e3372] %s%s\n' "$c_r" "$*" "$c_0" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || die "нужен root"
-command -v apt-get >/dev/null 2>&1 || die "поддерживается только Debian/Proxmox (apt)"
+command -v systemctl >/dev/null 2>&1 || die "нужен systemd"
+command -v ip >/dev/null 2>&1        || die "нужен iproute2 (есть в Proxmox по умолчанию)"
 
-# ---------------------------------------------------------------------------
-log "1/6 пакеты…"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq usb-modeswitch usb-modeswitch-data networkd-dispatcher curl iproute2 >/dev/null
-# драйверы для CDC-Ether/RNDIS/NCM есть в стоковом ядре Proxmox — грузим на всякий
+# systemd-networkd входит в systemd, отдельно ставить НЕ надо
+[ -x /lib/systemd/systemd-networkd ] || [ -x /usr/lib/systemd/systemd-networkd ] \
+  || warn "systemd-networkd бинарь не найден — очень необычно для Proxmox, продолжаю"
+
+log "1/5 драйверы ядра (есть в стоке, грузим на всякий)…"
 modprobe -a cdc_ether rndis_host cdc_ncm huawei_cdc_ncm 2>/dev/null || true
+[ -f "$OLD_HOOK" ] && { rm -f "$OLD_HOOK"; log "удалён старый networkd-dispatcher hook"; }
 
 # ---------------------------------------------------------------------------
-log "2/6 systemd-networkd: подъём HiLink-интерфейсов по DHCP…"
+log "2/5 systemd-networkd: подъём HiLink-интерфейсов по DHCP…"
 install -d "$NETDIR"
 cat > "$NETDIR/25-hilink.network" <<'NET'
-# Матчим ТОЛЬКО модемы по драйверу (физический NIC/vmbr не трогаем).
-# У всех E3372 одинаковый MAC — поэтому матч по имени/MAC не годится.
+# Матчим ТОЛЬКО модемы по драйверу (physical NIC/vmbr не трогаем).
+# У всех E3372 одинаковый MAC — матч по имени/MAC не годится.
 [Match]
 Driver=cdc_ether rndis_host cdc_ncm huawei_cdc_ncm
 
@@ -64,7 +68,7 @@ RequiredForOnline=no
 NET
 
 # ---------------------------------------------------------------------------
-log "3/6 sysctl: loose reverse-path filter (иначе ответы на 20 iface режутся)…"
+log "3/5 sysctl: loose reverse-path filter…"
 cat > /etc/sysctl.d/99-e3372.conf <<'SYS'
 net.ipv4.conf.all.rp_filter=2
 net.ipv4.conf.default.rp_filter=2
@@ -72,51 +76,69 @@ SYS
 sysctl -q --system >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
-log "4/6 policy-routing hook (авто на boot/hotplug)…"
-install -d "$(dirname "$HOOK")"
-cat > "$HOOK" <<'HOOK'
+log "4/5 policy-routing: реконсайлер + systemd timer (без внешних демонов)…"
+install -d "$(dirname "$ROUTE_SH")"
+cat > "$ROUTE_SH" <<'ROUTE'
 #!/bin/bash
-# networkd-dispatcher вызывает с env $IFACE, когда линк становится routable.
-# Подсеть выводим из выданного DHCP адреса 192.168.<N>.100.
-ip4=$(ip -4 -o addr show dev "$IFACE" 2>/dev/null | awk '{print $4}' | head -n1)
-[ -n "$ip4" ] || exit 0
-IP=${ip4%/*}
-case "$IP" in 192.168.*."100") ;; *) exit 0 ;; esac
-N=$(printf '%s' "$IP" | cut -d. -f3)
+# Идемпотентно приводит per-modem policy routing к нужному виду.
+# Подсеть выводится из выданного DHCP адреса 192.168.<N>.100.
+sysctl -q -w net.ipv4.conf.all.rp_filter=2 2>/dev/null || true
+ip -4 -o addr show | awk '/192\.168\.[0-9]+\.100\//{print $2, $4}' | while read -r IFACE CIDR; do
+  IP=${CIDR%/*}; N=$(printf '%s' "$IP" | cut -d. -f3)
+  # коллизия: если 192.168.<N>.x занята другим (не этим) интерфейсом (LAN хоста) — пропускаем
+  if ip -4 -o addr show | awk -v pat="192.168.$N." -v me="$IFACE" \
+       '$2!=me && index($4,pat)==1 {f=1} END{exit !f}'; then
+    logger -t e3372 "skip N=$N ($IFACE): подсеть занята хостом"
+    continue
+  fi
+  ip route replace 192.168.$N.0/24 dev "$IFACE" src "$IP" table "$N"
+  ip route replace default via 192.168.$N.1 dev "$IFACE" table "$N"
+  ip rule show | grep -q "from $IP " || ip rule add from "$IP/32" table "$N" priority $((1000+N))
+done
+ROUTE
+chmod +x "$ROUTE_SH"
 
-# --- защита от коллизии: если 192.168.<N>.x уже занята другим (не модемным)
-#     интерфейсом (напр. LAN хоста на vmbr0) — не трогаем маршруты вообще.
-if ip -4 -o addr show | awk -v pat="192.168.$N." -v me="$IFACE" \
-     '$2!=me && index($4,pat)==1 {f=1} END{exit !f}'; then
-  logger -t e3372 "skip N=$N ($IFACE): подсеть занята хостом"
-  exit 0
-fi
+cat > /etc/systemd/system/e3372-route.service <<EOF
+[Unit]
+Description=e3372 per-modem policy routing (reconcile)
+After=systemd-networkd.service network-online.target
+Wants=network-online.target
 
-ip route replace 192.168.$N.0/24 dev "$IFACE" src "$IP" table "$N"
-ip route replace default via 192.168.$N.1 dev "$IFACE" table "$N"
-ip rule show | grep -q "from $IP " || ip rule add from "$IP/32" table "$N" priority $((1000+N))
-logger -t e3372 "up: $IFACE $IP -> table $N (gw 192.168.$N.1)"
-HOOK
-chmod +x "$HOOK"
+[Service]
+Type=oneshot
+ExecStart=$ROUTE_SH
+EOF
+
+cat > /etc/systemd/system/e3372-route.timer <<'EOF'
+[Unit]
+Description=e3372 routing reconcile (boot + каждые 15с, ловит hotplug)
+
+[Timer]
+OnBootSec=10
+OnUnitActiveSec=15
+AccuracySec=2s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+# udev-«толчок»: при появлении сетевого устройства сразу дёрнуть реконсайлер
+cat > /etc/udev/rules.d/72-e3372.rules <<'EOF'
+ACTION=="add", SUBSYSTEM=="net", ENV{ID_NET_DRIVER}=="cdc_ether", RUN+="/bin/systemctl start --no-block e3372-route.service"
+ACTION=="add", SUBSYSTEM=="net", ENV{ID_NET_DRIVER}=="rndis_host", RUN+="/bin/systemctl start --no-block e3372-route.service"
+EOF
+udevadm control --reload 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-log "5/6 сервисы + применяю к уже поднятым модемам…"
-systemctl enable --now systemd-networkd    >/dev/null 2>&1 || true
-systemctl enable --now networkd-dispatcher >/dev/null 2>&1 || true
+log "5/5 включаю сервисы + применяю сейчас…"
+systemctl daemon-reload
+systemctl enable --now systemd-networkd >/dev/null 2>&1 || true
+systemctl enable --now e3372-route.timer >/dev/null 2>&1 || true
 systemctl restart systemd-networkd
-sleep 2   # дать DHCP выдать адреса
+sleep 2
+systemctl start e3372-route.service || true
 
-# dispatcher срабатывает только на переходах — прогоняем hook руками
-# для интерфейсов, что уже подняты сейчас.
-applied=0
-while read -r IFACE _; do
-  [ -n "$IFACE" ] || continue
-  IFACE="$IFACE" bash "$HOOK" && applied=$((applied+1)) || true
-done < <(ip -4 -o addr show | awk '/192\.168\.[0-9]+\.100\//{print $2, $4}')
-log "policy-routing применён к $applied модемам"
-
-# ---------------------------------------------------------------------------
-log "6/6 ставлю диагностику e3372-check…"
+# диагностика
 cat > "$CHECK" <<'CHK'
 #!/bin/bash
 # Проверка модемов E3372 HiLink: USB -> iface/IP -> webui -> cellular -> exit IP
@@ -140,9 +162,8 @@ CHK
 chmod +x "$CHECK"
 
 echo
-log "готово. проверка:  e3372-check"
+log "готово — без единой внешней зависимости. проверка:  e3372-check"
 echo
-"$CHECK" || true
+"$CHECK" 2>/dev/null || warn "curl не найден для диагностики — сам роутинг это не затрагивает"
 echo
-warn "Если у модема EXIT-IP='—' при CONN=онлайн — перепроверь его APN/сигнал."
-warn "Модемы, чья подсеть 192.168.<N>.x совпала с сетью хоста, авто-пропущены (см. journalctl -t e3372)."
+warn "Роутинг переприменяется на boot и каждые 15с (ловит hotplug). Лог: journalctl -t e3372"

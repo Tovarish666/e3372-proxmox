@@ -1,0 +1,10 @@
+[Unit]
+Description=e3372 routing reconcile (boot + каждые 15с)
+
+[Timer]
+OnBootSec=10
+OnUnitActiveSec=15
+AccuracySec=2s
+
+[Install]
+WantedBy=timers.target
