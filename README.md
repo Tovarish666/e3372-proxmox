@@ -35,7 +35,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Tovarish666/e3372-proxmox/ma
 | 3 | Поднимает интерфейсы модемов по DHCP — **systemd-networkd** (матч по драйверу, не по имени/MAC: у всех E3372 одинаковый MAC) |
 | 4 | Loose `rp_filter` |
 | 5 | **Per-modem policy routing** через networkd-dispatcher hook — авто на boot и hotplug |
-| 6 | Ставит диагностику `e3372-check` |
+| 6 | **Watchdog** (`e3372-watchdog.timer`, каждые 30с): реконсайл маршрутов, пере-DHCP упавших iface, страховка DNS; ставит `e3372-check` |
+
+## DNS-нейтральность
+
+Модемы **не влияют на DNS хоста**: в `.network` заданы `UseDNS=no`, `UseDomains=no`,
+`DNSDefaultRoute=no`, `DNS=` — модемные линки исключены из резолвинга. Установщик снимает
+снимок `/etc/resolv.conf` и восстанавливает его, если он остался без `nameserver`; watchdog
+подстраховывает то же в рантайме (обычные файлы; симлинки resolved не трогает).
 
 ## Как вшиты зависимости
 

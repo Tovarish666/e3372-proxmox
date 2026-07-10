@@ -1,0 +1,6 @@
+[Unit]
+Description=e3372 watchdog (routing + modem health + DNS safety)
+After=systemd-networkd.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/e3372-watchdog.sh

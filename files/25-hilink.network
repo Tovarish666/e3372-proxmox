@@ -5,12 +5,16 @@ Driver=cdc_ether rndis_host cdc_ncm huawei_cdc_ncm
 DHCP=ipv4
 LinkLocalAddressing=no
 IPv6AcceptRA=no
+DNS=
+DNSDefaultRoute=no
 
 [DHCPv4]
 UseDNS=no
+UseDomains=no
 UseNTP=no
 UseGateway=false
 UseRoutes=false
+UseHostname=no
 
 [Link]
 RequiredForOnline=no

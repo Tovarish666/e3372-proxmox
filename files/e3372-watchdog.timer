@@ -1,0 +1,8 @@
+[Unit]
+Description=e3372 watchdog каждые 30с
+[Timer]
+OnBootSec=20
+OnUnitActiveSec=30
+AccuracySec=5s
+[Install]
+WantedBy=timers.target

@@ -28,6 +28,7 @@ CACHE=/var/cache/e3372
 NETDIR=/etc/systemd/network
 HOOK=/etc/networkd-dispatcher/routable.d/50-e3372
 CHECK=/usr/local/bin/e3372-check
+WATCHDOG=/usr/local/sbin/e3372-watchdog.sh
 
 c_g=$'\033[1;32m'; c_y=$'\033[1;33m'; c_r=$'\033[1;31m'; c_0=$'\033[0m'
 log(){  printf '%s[e3372]%s %s\n' "$c_g" "$c_0" "$*"; }
@@ -121,12 +122,17 @@ Driver=cdc_ether rndis_host cdc_ncm huawei_cdc_ncm
 DHCP=ipv4
 LinkLocalAddressing=no
 IPv6AcceptRA=no
+# DNS-нейтральность: модем НИКОГДА не влияет на резолвинг хоста
+DNS=
+DNSDefaultRoute=no
 
 [DHCPv4]
 UseDNS=no
+UseDomains=no
 UseNTP=no
 UseGateway=false
 UseRoutes=false
+UseHostname=no
 
 [Link]
 RequiredForOnline=no
@@ -165,17 +171,88 @@ HOOK
 chmod +x "$HOOK"
 
 # ---------------------------------------------------------------------------
-log "6/6 сервисы + применяю к уже поднятым модемам…"
+log "6/6 сервисы, watchdog, применяю к поднятым модемам…"
+
+# --- DNS-страховка: снимок resolv.conf до перезапуска networkd ---
+RESOLV_BAK=$(mktemp); cp -a /etc/resolv.conf "$RESOLV_BAK" 2>/dev/null || true
+
 systemctl enable --now systemd-networkd    >/dev/null 2>&1 || true
 systemctl enable --now networkd-dispatcher >/dev/null 2>&1 || true
 systemctl restart systemd-networkd
 sleep 2
+
+# модемы НЕ должны обнулить DNS хоста: если resolv.conf остался без nameserver — вернём
+if [ ! -L /etc/resolv.conf ] && ! grep -q '^nameserver' /etc/resolv.conf 2>/dev/null; then
+  warn "resolv.conf без nameserver после networkd — восстанавливаю"
+  if grep -q '^nameserver' "$RESOLV_BAK" 2>/dev/null; then cp -a "$RESOLV_BAK" /etc/resolv.conf
+  else printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf; fi
+fi
+rm -f "$RESOLV_BAK"
+
 applied=0
 while read -r IFACE _; do
   [ -n "$IFACE" ] || continue
   IFACE="$IFACE" bash "$HOOK" && applied=$((applied+1)) || true
 done < <(ip -4 -o addr show | awk '/192\.168\.[0-9]+\.100\//{print $2, $4}')
 log "policy-routing применён к $applied модемам"
+
+# --- watchdog: routing + здоровье модемов + подстраховка DNS (host default route не трогает) ---
+install -d "$(dirname "$WATCHDOG")"
+cat > "$WATCHDOG" <<'WD'
+#!/bin/bash
+# e3372 watchdog — периодически держит систему в рабочем состоянии.
+# НЕ меняет default route/DNS хоста, кроме случая, когда resolv.conf (обычный файл)
+# остался ВООБЩЕ без nameserver — тогда ставит фолбэк, чтобы хост не ослеп.
+DRIVERS='cdc_ether|rndis_host|cdc_ncm|huawei_cdc_ncm'
+
+# 1) reconcile policy routing по всем поднятым модемам (идемпотентно)
+ip -4 -o addr show | awk '/192\.168\.[0-9]+\.100\//{print $2,$4}' | while read -r IFACE CIDR; do
+  IP=${CIDR%/*}; N=$(printf '%s' "$IP"|cut -d. -f3)
+  ip -4 -o addr show | awk -v pat="192.168.$N." -v me="$IFACE" \
+    '$2!=me && index($4,pat)==1{f=1}END{exit !f}' && { logger -t e3372-wd "skip N=$N: коллизия"; continue; }
+  ip route replace 192.168.$N.0/24 dev "$IFACE" src "$IP" table "$N"
+  ip route replace default via 192.168.$N.1 dev "$IFACE" table "$N"
+  ip rule show | grep -q "from $IP " || ip rule add from "$IP/32" table "$N" priority $((1000+N))
+done
+
+# 2) модемный интерфейс UP, но без IP -> дёрнуть переполучение DHCP
+for L in $(ip -o link show up | awk -F': ' '{print $2}' | sed 's/@.*//'); do
+  drv=$(ethtool -i "$L" 2>/dev/null | awk '/^driver:/{print $2}')
+  printf '%s' "$drv" | grep -qE "^($DRIVERS)$" || continue
+  ip -4 -o addr show dev "$L" | grep -q 'inet ' && continue
+  logger -t e3372-wd "iface $L без IP — networkctl reconfigure"
+  networkctl reconfigure "$L" 2>/dev/null || true
+done
+
+# 3) DNS safety-net: обычный resolv.conf вообще без nameserver -> фолбэк (симлинки не трогаем)
+if [ ! -L /etc/resolv.conf ] && ! grep -q '^nameserver' /etc/resolv.conf 2>/dev/null; then
+  logger -t e3372-wd "resolv.conf без nameserver — ставлю фолбэк 1.1.1.1/8.8.8.8"
+  printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+fi
+WD
+chmod +x "$WATCHDOG"
+
+cat > /etc/systemd/system/e3372-watchdog.service <<EOF
+[Unit]
+Description=e3372 watchdog (routing + modem health + DNS safety)
+After=systemd-networkd.service
+[Service]
+Type=oneshot
+ExecStart=$WATCHDOG
+EOF
+cat > /etc/systemd/system/e3372-watchdog.timer <<'EOF'
+[Unit]
+Description=e3372 watchdog каждые 30с (boot + периодически)
+[Timer]
+OnBootSec=20
+OnUnitActiveSec=30
+AccuracySec=5s
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now e3372-watchdog.timer >/dev/null 2>&1 || true
+log "watchdog включён (e3372-watchdog.timer, каждые 30с)"
 
 # диагностика
 cat > "$CHECK" <<'CHK'
