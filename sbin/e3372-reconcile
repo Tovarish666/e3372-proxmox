@@ -59,13 +59,8 @@ step_power() {
 #    подождать -> повторить -> принудительно пере-enumerate.
 # ---------------------------------------------------------------------------
 step_zerocd() {
-    # Раньше здесь был молчаливый выход. Если пакет не встал, модемы просто
-    # висели в CD-ROM без единой строчки в журнале — это надо видеть.
-    if ! command -v usb_modeswitch >/dev/null 2>&1; then
-        log_once "usb_modeswitch не установлен — переключать Zero-CD нечем (apt install usb-modeswitch usb-modeswitch-data)"
-        return 0
-    fi
-    local d port pid tries cfg bus dev out rc
+    command -v usb_modeswitch >/dev/null 2>&1 || return 0
+    local d port pid tries cfg bus dev
     while read -r d; do
         [ -d "$d" ] || continue
         port=$(dev_port "$d"); pid=$(dev_attr "$d" idProduct)
@@ -84,18 +79,7 @@ step_zerocd() {
         bus=$(dev_attr "$d" busnum); dev=$(dev_attr "$d" devnum)
         [ -n "$bus" ] && [ -n "$dev" ] || continue
         log "$port 12d1:$pid в CD-ROM — usb_modeswitch (попытка $(( tries + 1 )))"
-        # -v/-p обязательны. Конфиг не содержит DefaultVendor/DefaultProduct, а
-        # -b/-g лишь сужают поиск, но сами устройство не задают: без -v/-p
-        # usb_modeswitch не знает, что искать, и выходит с ошибкой ничего не сделав.
-        out=$(usb_modeswitch -v 12d1 -p "$pid" -b "$bus" -g "$dev" -c "$cfg" 2>&1); rc=$?
-        if [ "$rc" != 0 ]; then
-            # Запасной путь без привязки к шине: переключит первое совпавшее
-            # устройство. Парк одинаковый, за несколько циклов разберёт всех.
-            out=$(usb_modeswitch -v 12d1 -p "$pid" -c "$cfg" 2>&1); rc=$?
-        fi
-        if [ "$rc" != 0 ]; then
-            log_once "usb_modeswitch rc=$rc: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)"
-        fi
+        usb_modeswitch -v 12d1 -p "$pid" -b "$bus" -g "$dev" -c "$cfg" >/dev/null 2>&1
         st_set "zerocd.$port" $(( tries + 1 ))
     done < <(usb_devs)
     return 0
