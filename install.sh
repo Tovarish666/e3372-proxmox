@@ -57,50 +57,66 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Зависимости. Вшитый offline-репо, если он есть в дереве; иначе apt.
-#    Ни одна из них не критична для запуска: без usb_modeswitch не работает
-#    только Zero-CD, без curl — только web-API. Драйвер стартует в любом случае.
+# 2. Зависимости.
+#
+#    usb_modeswitch критичен: без него модемы навсегда остаются в Zero-CD, а это
+#    первая задача драйвера. Раньше здесь всё уходило в /dev/null, установка
+#    проходила вхолостую и на выходе была одна строчка предупреждения, которую
+#    легко пролистать. Теперь: ничего не глушится, apt не спрашиваем о том, что
+#    ставить (его симуляция и возвращала пустой список), в конце жёсткая проверка.
 # ---------------------------------------------------------------------------
 log "2/7 зависимости…"
-NEED=""
-for p in usb-modeswitch usb-modeswitch-data curl ethtool usbutils; do
-    case "$p" in
-        curl)     command -v curl     >/dev/null 2>&1 && continue ;;
-        ethtool)  command -v ethtool  >/dev/null 2>&1 && continue ;;
-        usbutils) command -v lsusb    >/dev/null 2>&1 && continue ;;
-        usb-modeswitch) command -v usb_modeswitch >/dev/null 2>&1 && continue ;;
-        usb-modeswitch-data) [ -d /usr/share/usb_modeswitch ] && continue ;;
-    esac
-    NEED="$NEED $p"
-done
+DEBDIR="$SRC/deb"
+pkg_installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'ok installed'; }
 
-if [ -n "${NEED// /}" ]; then
-    DEBDIR="$SRC/deb"
-    if [ -s "$DEBDIR/Release" ]; then
-        log "    ставлю офлайн из вшитого репо:$NEED"
-        LIST=$(mktemp)
-        echo "deb [trusted=yes] file:$DEBDIR ./" > "$LIST"
-        APT=(apt-get -o Dir::Etc::SourceList="$LIST" -o Dir::Etc::SourceParts=/dev/null
-             -o APT::Get::List-Cleanup=0 -o Acquire::AllowInsecureRepositories=true)
-        "${APT[@]}" update >/dev/null 2>&1
-        files=()
-        while read -r pkg; do
-            [ -n "$pkg" ] || continue
-            fp=$(ls "$DEBDIR/${pkg}_"*.deb 2>/dev/null | head -1)
-            [ -n "$fp" ] && files+=("$fp")
-        done < <("${APT[@]}" install -s --no-install-recommends $NEED 2>/dev/null | awk '/^Inst /{print $2}')
-        if [ "${#files[@]}" -gt 0 ]; then
-            dpkg -i "${files[@]}" >/dev/null 2>&1 || dpkg -i "${files[@]}" >/dev/null 2>&1 || true
-        fi
-        rm -f "$LIST"
-    else
-        log "    ставлю через apt:$NEED"
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $NEED >/dev/null 2>&1 \
-            || warn "apt не смог поставить часть пакетов — продолжаю, функциональность урезана"
+NEED=""
+pkg_installed usb-modeswitch       || NEED="$NEED usb-modeswitch"
+pkg_installed usb-modeswitch-data  || NEED="$NEED usb-modeswitch-data"
+pkg_installed libusb-1.0-0         || NEED="$NEED libusb-1.0-0"
+command -v curl    >/dev/null 2>&1 || NEED="$NEED curl"
+command -v ethtool >/dev/null 2>&1 || NEED="$NEED ethtool"
+command -v lsusb   >/dev/null 2>&1 || NEED="$NEED usbutils"
+
+if [ -z "${NEED// /}" ]; then
+    log "    всё нужное уже установлено"
+else
+    log "    не хватает:$NEED"
+    # Попытка 1: вшитые .deb напрямую через dpkg. Берём ровно те пакеты, которых
+    # нет в системе, поэтому downgrade установленного исключён по построению.
+    files=()
+    for p in $NEED; do
+        fp=$(ls "$DEBDIR/${p}_"*.deb 2>/dev/null | head -1)
+        if [ -n "$fp" ]; then files+=("$fp"); else warn "    в deb/ нет пакета $p"; fi
+    done
+    if [ "${#files[@]}" -gt 0 ]; then
+        log "    ставлю из вшитого репо (${#files[@]} .deb)…"
+        dpkg -i "${files[@]}" 2>&1 | sed 's/^/      /'
+        dpkg --configure -a 2>&1 | sed 's/^/      /'
+    fi
+    # Попытка 2: сеть — только для того, что после этого всё ещё отсутствует.
+    STILL=""
+    for p in $NEED; do pkg_installed "$p" || STILL="$STILL $p"; done
+    if [ -n "${STILL// /}" ]; then
+        warn "после вшитого репо не хватает:$STILL — пробую apt из сети"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $STILL 2>&1 \
+            | tail -n 8 | sed 's/^/      /'
     fi
 fi
-for c in usb_modeswitch curl ethtool; do
-    command -v "$c" >/dev/null 2>&1 || warn "$c отсутствует — соответствующая часть драйвера отключится сама"
+
+if ! command -v usb_modeswitch >/dev/null 2>&1; then
+    if [ "${SKIP_MODESWITCH:-0}" = 1 ]; then
+        warn "usb_modeswitch нет, но задан SKIP_MODESWITCH=1 — продолжаю без Zero-CD"
+    else
+        die "usb_modeswitch так и не установился.
+     Модемы в Zero-CD (12d1:1f01) переключить нечем — это первая задача драйвера,
+     поэтому установка остановлена, чтобы вы не получили молча неработающий парк.
+     Поставьте вручную и запустите снова:
+         apt-get install -y usb-modeswitch usb-modeswitch-data
+     Продолжить без Zero-CD:  SKIP_MODESWITCH=1 bash install.sh"
+    fi
+fi
+for c in curl ethtool; do
+    command -v "$c" >/dev/null 2>&1 || warn "$c отсутствует — часть диагностики будет недоступна"
 done
 
 modprobe -a cdc_ether rndis_host cdc_ncm huawei_cdc_ncm >/dev/null 2>&1 || true
